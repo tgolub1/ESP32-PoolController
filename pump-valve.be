@@ -13,10 +13,12 @@ var PUMP_INHIBIT_TIME = (30 * 60)          # 30-minutes
 var PumpSM = nil                # pump state machine
 var PumpWindowActive = nil      # Pump Time Window Active [nil, -1, 0 to n]
 var PumpInhibitTimer = nil      # Pump Inhibut Timer
+var PumpInhibitCounter = nil    # Number of times that the Pool Pump became inhibited since midnight
 var ValveSM = nil               # water-valve state machine
 var ValveTimeoutTimer = nil     # Timestamp when the valve operation should end
 var ValveInhibitTimer = nil     # Timestamp when the valve refil lockout ends
 var ValveOffTimer = nil         # Timestamp when the valve MAN OFF time should expire
+var DailyValveOnCounter = nil   # Number of times that the Refill Valve has activated since midnight
 var actual_pump_state = nil     # Actual state of the Pump Output
 var actual_lights_state = nil   # Actual state of the Lights Output
 var actual_valve_state = nil    # Actual state of the Valve Output
@@ -120,10 +122,17 @@ end
 def set_valve_SM(newState)
   if (ValveSM == newState)
     # The new Valve SM state matches the existing one - ignore the request
-    return
+    # print("BR VALVE: Current State = " .. valve_state_name(ValveSM))
   else
     # Set the Valve SM state to the new value
     print("BR VALVE: Valve SM state " .. valve_state_name(ValveSM) .. " -> " .. valve_state_name(newState))
+    if (newState == VALVESTATE["ON_AUT"])
+      if (DailyValveOnCounter == nil)
+        DailyValveOnCounter = 1
+      else
+        DailyValveOnCounter += 1
+      end
+    end
     ValveSM = newState
   end
 end
@@ -147,7 +156,7 @@ end
 
 # Read in the current minute since midnight
 def get_current_minute()
-  var timestamp = tasmota.rtc("local")
+  var timestamp = tasmota.rtc()["local"]
   if ((timestamp == nil) || (timestamp == 0))
     # Time not yet available post boot
     return (nil)
@@ -190,15 +199,32 @@ end
 
 # ------------------------------ Main Loop for Valve Control Logic -----------------------------------
 def evaluate_valve_state()
+
+  # print("BR VALVE: Valve SM = " .. valve_state_name(ValveSM))
+
   var nVSM = nil   # next Pump State Machine State
   var nVPow = nil  # next Pump Power State
 
   if (critical_low_level && (ValveSM != VALVESTATE["LOCKOUT"]) && (ValveSM != VALVESTATE["INHIBIT"]) && (ValveSM != VALVESTATE["ON_AUT"]))
-    # we are currently not inhibited but the pool tank is empty
-    print("BR VALVE: ALARM - Pool Water Level Critically Low - Level Tank is Empty. Opening the Refill Valve.")
-    if (!actual_valve_state || (ValveTimeoutTimer == nil))
-      ValveTimeoutTimer = tasmota.millis(VALVE_MAXON_TIME * 1000)  # set the valve fill time
+    if ((DailyValveOnCounter != nil) && (DailyValveOnCounter >= 3))
+      # Do not allow the critical-low path to bypass the daily refill limit
+      print("BR VALVE: ALARM - Pool water is critically low, but the daily refill limit has been reached. Moving valve to LOCKOUT.")
+      ValveTimeoutTimer = nil
+      ValveInhibitTimer = nil
+      ValveOffTimer = nil
+      set_valve_SM(VALVESTATE["LOCKOUT"])
+      set_valve_power(OFF)
+      return
     end
+    # Daily refill limit has not been reached
+    print("BR VALVE: ALARM - Pool water level critically low. Opening the refill valve.")
+    # Preserve an existing valid ON timer; otherwise start a new safety timer
+    if (!actual_valve_state || (ValveTimeoutTimer == nil))
+      ValveTimeoutTimer = tasmota.millis(VALVE_MAXON_TIME * 1000)
+    end
+    # A critical-low refill overrides and cancels any manual-OFF hold
+    ValveOffTimer = nil
+    ValveInhibitTimer = nil
     set_valve_SM(VALVESTATE["ON_AUT"])
     set_valve_power(ON)
     return
@@ -211,25 +237,43 @@ def evaluate_valve_state()
     set_valve_power(OFF)
     return
 
-  elif (ValveSM == VALVESTATE["INHIBIT"])  # valve inhibit active
-    if ((ValveInhibitTimer != nil) && tasmota.time_reached(ValveInhibitTimer))
-      # inhibit timer has expired, lockout not in effect
+  elif (ValveSM == VALVESTATE["INHIBIT"])
+    if (ValveInhibitTimer == nil)
+      # INHIBIT cannot recover predictably without a valid timer
+      print("BR VALVE: ERROR - Valve INHIBIT has no timer. Moving valve to LOCKOUT.")
+      ValveTimeoutTimer = nil
+      ValveOffTimer = nil
       ValveInhibitTimer = nil
-      if (critical_low_level || actual_min_level)  # water level is low - re-activate refill valve
-        print("BR VALVE: Valve Inhibit Period Has Ended.  Pool Water Level is still low.  Turning the Refill Valve ON.")
-        ValveTimeoutTimer = tasmota.millis(VALVE_MAXON_TIME * 1000)  # set the valve fill time
-        set_valve_SM(VALVESTATE["ON_AUT"])
-        set_valve_power(ON)
-      else  # Water Level is not low
-        ValveTimeoutTimer = nil
+      set_valve_SM(VALVESTATE["LOCKOUT"])
+      set_valve_power(OFF)
+    elif (tasmota.time_reached(ValveInhibitTimer))
+      # The complete inhibit period has elapsed
+      ValveInhibitTimer = nil
+      ValveTimeoutTimer = nil
+      ValveOffTimer = nil
+      if (critical_low_level || actual_min_level)
+        # Water remains below the automatic refill threshold
+        if ((DailyValveOnCounter == nil) || (DailyValveOnCounter < 3))
+          print("BR VALVE: Valve inhibit period ended and water level remains low. Resuming automatic refill.")
+          ValveTimeoutTimer = tasmota.millis(VALVE_MAXON_TIME * 1000)
+          set_valve_SM(VALVESTATE["ON_AUT"])
+          set_valve_power(ON)
+        else
+          print("BR VALVE: ALARM - Valve inhibit period ended, but the daily refill limit has been reached. Moving valve to LOCKOUT.")
+          set_valve_SM(VALVESTATE["LOCKOUT"])
+          set_valve_power(OFF)
+        end
+      else
+        # Water is no longer low; return to normal automatic OFF
         set_valve_SM(VALVESTATE["OFF_AUT"])
         set_valve_power(OFF)
       end
-    else  # inhibit timer is still counting - enforce inhibit
+    else
+      # Inhibit timer is valid and still counting
       ValveTimeoutTimer = nil
+      ValveOffTimer = nil
       set_valve_SM(VALVESTATE["INHIBIT"])
       set_valve_power(OFF)
-      return
     end
 
   elif (((ValveSM == VALVESTATE["ON_AUT"]) || (ValveSM == VALVESTATE["ON_MAN"])) && !actual_valve_state)  # manual override
@@ -248,31 +292,50 @@ def evaluate_valve_state()
     set_valve_power(ON)
 
   elif ((ValveSM == VALVESTATE["ON_MAN"]) && actual_valve_state)
-    # remain in ON_MAN for the duration of the Valve ON Time
-    if ((ValveTimeoutTimer != nil) && tasmota.time_reached(ValveTimeoutTimer))
+    if (ValveTimeoutTimer == nil)
+      print("BR VALVE: ERROR - ON_MAN has no safety timer. Inhibiting valve.")
+      ValveInhibitTimer = tasmota.millis(VALVE_INHIBIT_TIME * 1000)
+      set_valve_SM(VALVESTATE["INHIBIT"])
+      set_valve_power(OFF)
+    elif (tasmota.time_reached(ValveTimeoutTimer))
       ValveTimeoutTimer = nil
       ValveInhibitTimer = tasmota.millis(VALVE_INHIBIT_TIME * 1000)
       set_valve_SM(VALVESTATE["INHIBIT"])
       set_valve_power(OFF)
-    else  # Valve On Timer still counting
-      # remain in Valve State ON_MAN
+    else
       set_valve_SM(VALVESTATE["ON_MAN"])
       set_valve_power(ON)
     end
 
   elif ((ValveSM == VALVESTATE["OFF_MAN"]) && !actual_valve_state)
-    if ((ValveOffTimer != nil) && tasmota.time_reached(ValveOffTimer))  # remain in the OFF_MAN until the critical or low water is detected or OFF time is reached
+    if ((ValveOffTimer != nil) && tasmota.time_reached(ValveOffTimer))
+      # The manual-OFF period has expired
       ValveOffTimer = nil
-      if (actual_min_level)  # tank water level has dipped below fill threshold but the tank is not empty
-        ValveTimeoutTimer = tasmota.millis(VALVE_MAXON_TIME * 1000)  # set the valve fill time
-        set_valve_SM(VALVESTATE["ON_AUT"])
-        set_valve_power(ON)
-      else  # tank water level is above fill threshold
+      if (actual_min_level)
+        # Water is below the minimum-level threshold
+        if ((DailyValveOnCounter == nil) || (DailyValveOnCounter < 3))
+          print("BR VALVE: Manual OFF period ended and water level is low. Resuming automatic refill.")
+          ValveInhibitTimer = nil
+          ValveTimeoutTimer = tasmota.millis(VALVE_MAXON_TIME * 1000)
+          set_valve_SM(VALVESTATE["ON_AUT"])
+          set_valve_power(ON)
+        else
+          # Do not allow OFF_MAN expiration to bypass the daily refill limit
+          print("BR VALVE: ALARM - Manual OFF period ended, but the daily refill limit has been reached. Moving valve to LOCKOUT.")
+          ValveTimeoutTimer = nil
+          ValveInhibitTimer = nil
+          set_valve_SM(VALVESTATE["LOCKOUT"])
+          set_valve_power(OFF)
+        end
+      else
+        # Water is above the minimum-level threshold; return to automatic OFF
         ValveTimeoutTimer = nil
+        ValveInhibitTimer = nil
         set_valve_SM(VALVESTATE["OFF_AUT"])
         set_valve_power(OFF)
       end
-    else  # ValveOffTimer is still running - enforce manual valve OFF time
+    else
+      # OFF timer is still running, or is missing; fail safely with valve OFF
       set_valve_SM(VALVESTATE["OFF_MAN"])
       set_valve_power(OFF)
     end
@@ -295,11 +358,22 @@ def evaluate_valve_state()
     end
 
   elif (ValveSM == VALVESTATE["OFF_AUT"] && !actual_valve_state)
-    if (actual_min_level)  # tank water level has dipped below fill threshold but the tank is not empty
+    if (actual_min_level && ((DailyValveOnCounter == nil) || (DailyValveOnCounter < 3)))
+      # tank water level has dipped below fill threshold but the tank is not empty
       ValveTimeoutTimer = tasmota.millis(VALVE_MAXON_TIME * 1000)  # set the valve fill time
       set_valve_SM(VALVESTATE["ON_AUT"])
       set_valve_power(ON)
-    else  # tank water level is above fill threshold
+    elif (actual_min_level && (DailyValveOnCounter >= 3))
+      print("BR VALVE: ALERT - 3rd daily refill valve activation attempt.  Valve moving to a LOCKOUT state.  Power cycle or restart required.")
+      ValveTimeoutTimer = nil
+      set_valve_SM(VALVESTATE["LOCKOUT"])
+      set_valve_power(OFF)
+    elif (!actual_min_level)  # tank water level is above fill threshold
+      ValveTimeoutTimer = nil
+      set_valve_SM(VALVESTATE["OFF_AUT"])
+      set_valve_power(OFF)
+    else
+      # Remain in OFF_AUT
       ValveTimeoutTimer = nil
       set_valve_SM(VALVESTATE["OFF_AUT"])
       set_valve_power(OFF)
@@ -316,7 +390,6 @@ def evaluate_valve_state()
     ValveOffTimer = nil
     set_valve_SM(VALVESTATE["OFF_AUT"])
     set_valve_power(OFF)
-
   end
 end
 
@@ -343,7 +416,13 @@ def set_pump_SM(newState)
     return
   else
     # Set the Pump SM State to the new value
-    print("BR PUMP&V: Pump SM state " .. pump_state_name(PumpSM) .. " -> " .. pump_state_name(newState))
+    if (newState == PUMPSTATE["INHIBIT"])
+      if (PumpInhibitCounter == nil)
+        PumpInhibitCounter = 1
+      else
+        PumpInhibitCounter += 1
+      end
+    end
     PumpSM = newState
   end
 end
@@ -351,61 +430,89 @@ end
 
 # ------------------------------------- Main Loop for Pump Control Logic ------------------------------------------
 def evaluate_pump_state()
-
+  # print("BR PUMP&V: Pump TW = " .. PumpWindowActive)
   var nextPSM = nil   # next Pump State Machine State
   var nextPPow = nil  # next Pump Power State
 
-  if (PumpSM == PUMPSTATE["LOCKOUT"])  # pump lockout active
-    # no questions asked - brrestart is the only way out
-    set_pump_SM(PUMPSTATE["LOCKOUT"])
-    set_pump_power(OFF)
-    return
-
-  elif (PumpSM == PUMPSTATE["INHIBIT"])  # pump inhibit active
-    if ((PumpInhibitTimer != nil) && tasmota.time_reached(PumpInhibitTimer))
-      # inhibit timer has expired, lockout not in effect
-      if (critical_low_level)
-        PumpInhibitTimer = tasmota.millis(PUMP_INHIBIT_TIME * 1000)
-        nextPSM = PUMPSTATE["INHIBIT"]
-        nextPPow = OFF
-      elif (ValveSM == VALVESTATE["ON_AUT"])
-        PumpInhibitTimer = nil
-        nextPSM = PUMPSTATE["ON_FILL"]
-        nextPPow = ON
-      else
-        PumpInhibitTimer = nil
-        if (PumpWindowActive == nil)  # Time is not yet active - make no changes
-          print("BR PUMP&V: ERROR - Time invalid inside of active INHIBIT state")
-          nextPSM = PumpSM
-          nextPPow = nil
-        elif (PumpWindowActive >= 0)
-          nextPSM = PUMPSTATE["ON_TW"]
-          nextPPow = ON
-        else
-          nextPSM = PUMPSTATE["OFF_TW"]
-          nextPPow = OFF
-        end
-      end
-    else
-      # inhibit timer is still counting
+  if (critical_low_level && (PumpSM != PUMPSTATE["LOCKOUT"]) && (PumpSM != PUMPSTATE["INHIBIT"]))
+    # Tank is critically empty. Stop the pump regardless of whether it was
+    # running for its schedule, manually, or to assist automatic filling.
+    if ((PumpInhibitCounter == nil) || (PumpInhibitCounter < 3))
+      print("BR PUMP&V: ALARM - Pool Water Level Critically Low. Stopping pump and entering INHIBIT.")
+      PumpInhibitTimer = tasmota.millis(PUMP_INHIBIT_TIME * 1000)
       set_pump_SM(PUMPSTATE["INHIBIT"])
       set_pump_power(OFF)
-      return
+    else
+      print("BR PUMP&V: ALARM - Pool Water Level Critically Low after repeated inhibits. Moving pump to LOCKOUT.")
+      PumpInhibitTimer = nil
+      set_pump_SM(PUMPSTATE["LOCKOUT"])
+      set_pump_power(OFF)
+    end
+    return
+  end
+
+  if (PumpSM == PUMPSTATE["LOCKOUT"])  # pump lockout active
+    # no questions asked - brrestart is the only way out
+    nextPSM = PUMPSTATE["LOCKOUT"]
+    nextPPow = OFF
+
+  elif (PumpSM == PUMPSTATE["INHIBIT"])
+    if (PumpInhibitTimer == nil)
+      # An inhibited pump without a valid timer cannot recover predictably
+      print("BR PUMP&V: ERROR - Pump INHIBIT has no timer. Moving pump to LOCKOUT.")
+      nextPSM = PUMPSTATE["LOCKOUT"]
+      nextPPow = OFF
+    elif (tasmota.time_reached(PumpInhibitTimer))
+      # The full inhibit period has elapsed
+      PumpInhibitTimer = nil
+      if (critical_low_level)
+        # Water is still critically low after the complete inhibit period
+        print("BR PUMP&V: ALARM - Tank remains critically empty after pump inhibit. Moving pump to LOCKOUT.")
+        nextPSM = PUMPSTATE["LOCKOUT"]
+        nextPPow = OFF
+      elif ((PumpInhibitCounter != nil) && (PumpInhibitCounter >= 3))
+        # Enforce the daily inhibit limit independently of valve or schedule
+        print("BR PUMP&V: ALARM - Pump inhibit limit reached. Moving pump to LOCKOUT.")
+        nextPSM = PUMPSTATE["LOCKOUT"]
+        nextPPow = OFF
+      elif (ValveSM == VALVESTATE["ON_AUT"])
+        # Water is no longer critically low and automatic filling continues
+        nextPSM = PUMPSTATE["ON_FILL"]
+        nextPPow = ON
+      elif (PumpWindowActive == nil)
+        # Time is unavailable; leave INHIBIT safely without starting the pump
+        print("BR PUMP&V: Pump inhibit ended, but current time is invalid. Moving to OFF_TW.")
+        nextPSM = PUMPSTATE["OFF_TW"]
+        nextPPow = OFF
+      elif (PumpWindowActive >= 0)
+        # Resume scheduled operation
+        nextPSM = PUMPSTATE["ON_TW"]
+        nextPPow = ON
+      else
+        # No refill and outside all scheduled windows
+        nextPSM = PUMPSTATE["OFF_TW"]
+        nextPPow = OFF
+      end
+    else
+      # Inhibit timer is valid and still counting
+      nextPSM = PUMPSTATE["INHIBIT"]
+      nextPPow = OFF
     end
 
-  elif (critical_low_level)  # pool empty and we are not in a LOCKOUT or INHIBIT
-    # we are currently not inhibited but the pool tank is empty - move to INHIBIT
-    print("BR PUMP&V: ALARM - Pool Water Level Critically Low - Level Tank is Empty. Moving to Pump Inhibit State and Opening the Valve.")
-    PumpInhibitTimer = tasmota.millis(PUMP_INHIBIT_TIME * 1000)  # set the inhibit time to 30-min timer
-    nextPSM = PUMPSTATE["INHIBIT"]
+  # Detect manual OFF before processing ON_FILL.
+  elif (((PumpSM == PUMPSTATE["ON_TW"]) || (PumpSM == PUMPSTATE["ON_MAN"]) || (PumpSM == PUMPSTATE["ON_FILL"])) && !actual_pump_state)
+    print("BR PUMP&V: Manual Pump OFF Override Detected.")
+    nextPSM = PUMPSTATE["OFF_MAN"]
     nextPPow = OFF
 
   elif (PumpSM == PUMPSTATE["ON_FILL"])
-    if (ValveSM == VALVESTATE["ON_AUT"])  # the valve is still on - continue to run the pump
+    if (ValveSM == VALVESTATE["ON_AUT"])
+      # Automatic filling is still active
       nextPSM = PUMPSTATE["ON_FILL"]
       nextPPow = ON
-    else  # The valve is no longer auto-filling the pool
-      if (PumpWindowActive == nil)  # Time is not yet active - make no changes
+    else
+      # Automatic filling has ended; return to schedule control
+      if (PumpWindowActive == nil)
         print("BR PUMP&V: ERROR - Time invalid inside of active ON_FILL state")
         nextPSM = PumpSM
         nextPPow = nil
@@ -418,64 +525,81 @@ def evaluate_pump_state()
       end
     end
 
-  elif (((PumpSM == PUMPSTATE["ON_TW"]) || (PumpSM == PUMPSTATE["ON_MAN"]) || (PumpSM == PUMPSTATE["ON_FILL"])) && !actual_pump_state)  # manual override
-    # manual pump OFF override
-    nextPSM = PUMPSTATE["OFF_MAN"]
-    nextPPow = OFF
-
-  elif (((PumpSM == PUMPSTATE["OFF_TW"]) || (PumpSM == PUMPSTATE["OFF_MAN"])) && actual_pump_state)  # manual override
-    # manual pump ON override
+  elif (((PumpSM == PUMPSTATE["OFF_TW"]) || (PumpSM == PUMPSTATE["OFF_MAN"])) && actual_pump_state)
+    # Manual pump ON override
+    print("BR PUMP&V: Manual Pump ON Override Detected.")
     nextPSM = PUMPSTATE["ON_MAN"]
     nextPPow = ON
 
   elif ((PumpSM == PUMPSTATE["ON_MAN"]) && actual_pump_state)
-    if (PumpWindowActive == nil)  # Time is not yet active - make no changes
+    if (PumpWindowActive == nil)
       print("BR PUMP&V: ERROR - Time invalid inside of active ON_MAN state")
       nextPSM = PumpSM
       nextPPow = nil
-    elif (PumpWindowActive >= 0)  # ON_TW window is now active
+    elif (PumpWindowActive >= 0)
+      # Scheduled window has started; release manual ON override
       nextPSM = PUMPSTATE["ON_TW"]
       nextPPow = ON
-    else  # we remain outside of all active windows - hold the Pump ON for the duration of the manual override
+    else
+      # Continue manual ON outside scheduled windows
       nextPSM = PUMPSTATE["ON_MAN"]
       nextPPow = ON
     end
 
   elif ((PumpSM == PUMPSTATE["OFF_MAN"]) && !actual_pump_state)
-    if (PumpWindowActive == nil)  # Time is not yet active - make no changes
-      print("BR PUMP&V: ERROR - Time invalid inside of active OFF_MAN state")
-      nextPSM = PumpSM
-      nextPPow = nil
-    elif (PumpWindowActive >= 0)  # ON_TW window is still active - hold the Pump OFF for the duration of the manual override
+    if (ValveSM == VALVESTATE["ON_AUT"])
+      # Manual OFF overrides ON_FILL for the remainder of this refill
       nextPSM = PUMPSTATE["OFF_MAN"]
       nextPPow = OFF
-    else  # we are now outside of all active windows - release the manual OFF hold
+    elif (PumpWindowActive == nil)
+      # Time is unavailable; retain the safe manual-OFF state
+      print("BR PUMP&V: ERROR - Time invalid inside of active OFF_MAN state")
+      nextPSM = PUMPSTATE["OFF_MAN"]
+      nextPPow = OFF
+    elif (PumpWindowActive >= 0)
+      # Continue manual OFF until the active window ends
+      nextPSM = PUMPSTATE["OFF_MAN"]
+      nextPPow = OFF
+    else
+      # Refill and scheduled window have both ended
       nextPSM = PUMPSTATE["OFF_TW"]
       nextPPow = OFF
     end
 
   elif (PumpSM == PUMPSTATE["ON_TW"])
-    if (PumpWindowActive == nil)  # Time is not yet active - make no changes
+    if (ValveSM == VALVESTATE["ON_AUT"])
+      # Automatic refill started while pump was already running
+      nextPSM = PUMPSTATE["ON_FILL"]
+      nextPPow = ON
+    elif (PumpWindowActive == nil)
+      # Time is not yet valid; preserve current pump state
       print("BR PUMP&V: ERROR - Time invalid inside of active ON_TW state")
       nextPSM = PumpSM
       nextPPow = nil
-    elif (PumpWindowActive >=0)  # stay in ON_TW since there are no other priorities
+    elif (PumpWindowActive >= 0)
+      # Remain in the active pump time window
       nextPSM = PUMPSTATE["ON_TW"]
       nextPPow = ON
     else
+      # Pump window has ended
       nextPSM = PUMPSTATE["OFF_TW"]
       nextPPow = OFF
     end
 
   elif (PumpSM == PUMPSTATE["OFF_TW"])
-    if (PumpWindowActive == nil)  # Time is not yet active - make no changes
+    if (ValveSM == VALVESTATE["ON_AUT"])
+      # Automatic refill requires the pump outside its normal schedule
+      nextPSM = PUMPSTATE["ON_FILL"]
+      nextPPow = ON
+    elif (PumpWindowActive == nil)
+      # Time is not yet valid; preserve current pump state
       print("BR PUMP&V: ERROR - Time invalid inside of active OFF_TW state")
       nextPSM = PumpSM
       nextPPow = nil
-    elif (PumpWindowActive >=0)
+    elif (PumpWindowActive >= 0)
       nextPSM = PUMPSTATE["ON_TW"]
       nextPPow = ON
-    else  # stay in OFF_TW since there are no other priorities
+    else
       nextPSM = PUMPSTATE["OFF_TW"]
       nextPPow = OFF
     end
@@ -503,8 +627,14 @@ def evaluate_pump_state()
   end
 
   if (nextPSM != PumpSM)  # State Transistion
-    print("BR PUMP&V: Pump current SM = " .. str(PumpSM) .. " (" .. pump_state_name(PumpSM) .. ")" ..
-    ", new SM = " .. str(nextPSM) .. " (" .. pump_state_name(nextPSM) .. ")")
+    if ((nextPSM == PUMPSTATE["ON_TW"]) && (PumpWindowActive >= 0))
+      print("BR PUMP&V: Pump SM = " .. pump_state_name(PumpSM) .. " --> " .. pump_state_name(nextPSM) .. "  [OFF @ "
+      .. tasmota.strftime("%H:%M", PumpTimeWindows[PumpWindowActive][1] * 60) .. "]")
+    else
+       print("BR PUMP&V: Pump SM = " .. pump_state_name(PumpSM) .. " --> " .. pump_state_name(nextPSM))
+    end
+  else
+    # print("BR PUMP&V: PUMP Current State = " .. pump_state_name(PumpSM))
   end
 
   set_pump_SM(nextPSM)
@@ -563,6 +693,12 @@ def tank_max_level_changed(value, trigger, data)
   evaluate_states()
 end
 
+# Reset the Daily Valve Activation Counter
+def midnight_callback()
+  DailyValveOnCounter = 0
+  PumpInhibitCounter = 0
+end
+
 
 # ------------------------  CALLBACK REGISTRATION  ------------------------
 
@@ -591,6 +727,9 @@ tasmota.add_rule("Time#Initialized", evaluate_pump_schedule_rule)
 
 # Check for schedule boundaries every minute at 0s mark.
 tasmota.add_cron("0 * * * * *", evaluate_pump_schedule_cron, "pump_schedule")
+
+# Reset the Daily Valve Activation Counter at 5 past midnight every day
+tasmota.add_cron("45 4 0 * * *", midnight_callback, "midnight_0005")
 
 # Establish state immediately at script load instead of waiting for the first sensor, power, time, or cron event.
 print("BR PUMP&V: initial post reset main loop run")
