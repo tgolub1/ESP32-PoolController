@@ -15,5 +15,5 @@ def safe_load(filename)
     end
 end
 
-safe_load("pump-valve.bec")
-safe_load("lights.bec")
+safe_load("pump-valve.be")
+safe_load("lights.be")
