@@ -1,4 +1,5 @@
 var LIGHTS_RELAY_INDEX = 1  # Zero-based: Power2
+var LIGHTS_OFF_TIME = (23 * 60) + 45  # 23:45
 var current_lights_state = nil
 
 var LIGHTSTATE = {
@@ -11,7 +12,7 @@ var LIGHTSTATE = {
 # Determine if the active time window for pool lights operation is in effect
 # .. returns true if now is within the lights ON Window, false otherwise
 def get_active_lights_window()
-  var rtc = tasmota.rtc("local")
+  var rtc = tasmota.rtc()["local"]
   if ((rtc != nil) && (rtc !=0))
     var now = tasmota.time_dump(rtc)
     var current_minute = ((now['hour'] * 60) + now['min'])
@@ -26,16 +27,16 @@ def get_active_lights_window()
         print("BR LIGHTS: ERROR - Could not parse sunset_time")
         return (nil)
       else
-        var sunset_minutes = ((sunset_map['hour'] * 60) + sunset_map['min']) - 9  # 10 minute negative offset
+        var sunset_minutes = ((sunset_map['hour'] * 60) + sunset_map['min']) - 8  # 8 minute negative offset
         if (sunset_minutes < 0)
           print("BR LIGHTS: ERROR Midnight Wraparround Calculation in Effect")
           sunset_minutes += 1440  # wrap around midnight
         end
-        var end_window_time = (23 * 60) + 45  # 23:45
-        if (sunset_minutes <= end_window_time)
-          return ((current_minute >= sunset_minutes) && (current_minute < end_window_time))
+
+        if (sunset_minutes <= LIGHTS_OFF_TIME)
+          return ((current_minute >= sunset_minutes) && (current_minute < LIGHTS_OFF_TIME))
         else  # wrap around case
-          return ((current_minute >= sunset_minutes) || (current_minute <= end_window_time))
+          return ((current_minute >= sunset_minutes) || (current_minute <= LIGHTS_OFF_TIME))
         end
       end
     end
@@ -48,27 +49,58 @@ end
 def set_lights_power(onoff)
   # Read Power2 directly instead of relying on a shared cached value.
   var actual_lights_power = tasmota.get_power(LIGHTS_RELAY_INDEX)
-  print("BR LIGHTS: requested power = " .. str(onoff) .. ", actual power = " .. str(actual_lights_power))
+  # print("BR LIGHTS: requested power = " .. str(onoff) .. ", actual power = " .. str(actual_lights_power))
 
   if (actual_lights_power == onoff)
-    print("BR LIGHTS: relay already matches requested state")
     return
-  end
-
-  if (onoff)
-    print("BR LIGHTS: commanding Lights Relay ON")
   else
-    print("BR LIGHTS: commanding LIghts Relay OFF")
+    tasmota.set_power(LIGHTS_RELAY_INDEX, onoff)
+    print("BR LIGHTS: Switching the Lights Relay to = " .. str(onoff))
   end
+end
 
-  tasmota.set_power(LIGHTS_RELAY_INDEX, onoff)
-  print("BR LIGHTS: set_power = " .. str(onoff))
+
+# Return a TXT version of the lights state enumertation
+def lights_state_name(state)
+  if (state == nil)
+    return "UNINITIALIZED"
+  elif (state == LIGHTSTATE["OFF_TW"])
+    return "OFF_TW"
+  elif (state == LIGHTSTATE["OFF_MAN"])
+    return "OFF_MAN"
+  elif (state == LIGHTSTATE["ON_TW"])
+    return "ON_TW"
+  elif (state == LIGHTSTATE["ON_MAN"])
+    return "ON_MAN"
+  else
+    return "UNKNOWN"
+  end
+end
+
+
+# Return a local time stamp for the next Lights Auto-ON Time
+def get_next_ontw_time()
+  var ST7 = tasmota.cmd("Status 7", true)
+  if (!ST7 || !ST7.contains("StatusTIM"))
+    return (0)
+  else
+    var sunset_str = ST7["StatusTIM"]["Sunset"]  # e.g. 21:25
+    var sunset_map = tasmota.strptime(sunset_str, "%H:%M")
+    var sunset_minutes = ((sunset_map['hour'] * 60) + sunset_map['min']) - 8  # 8 minute negative offset
+    return sunset_minutes % 1440
+  end
 end
 
 
 def set_lights_state(new_state)
   if (current_lights_state != new_state)
-    print("BR LIGHTS: state " .. str(current_lights_state) .. " -> " .. str(new_state))
+    if (new_state == LIGHTSTATE["OFF_TW"])
+      print("BR LIGHTS: state " .. lights_state_name(current_lights_state) .. " -> " .. lights_state_name(new_state) .. ".  Next Auto-ON time @ "
+      .. tasmota.strftime("%H:%M", get_next_ontw_time() * 60))
+    elif (new_state == LIGHTSTATE["ON_TW"])
+      print("BR LIGHTS: state " .. lights_state_name(current_lights_state) .. " -> " .. lights_state_name(new_state) .. ".  Next Auto-OFF time @ "
+      .. tasmota.strftime("%H:%M", LIGHTS_OFF_TIME * 60))
+    end
     current_lights_state = new_state
   else
     # no change
